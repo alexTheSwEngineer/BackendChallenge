@@ -8,6 +8,9 @@ package com.n26.atrposki.domain;
 
 import lombok.Value;
 
+/**
+ * Immutable class that holds aggregated statistics: avg, min, max, sum, count.
+ * */
 @Value
 public class AggregateStatistics {
     private final double sum;

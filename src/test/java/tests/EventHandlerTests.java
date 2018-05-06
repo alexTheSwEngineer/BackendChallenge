@@ -7,8 +7,8 @@ package tests;
  */
 
 import com.n26.atrposki.utils.events.AggregateException;
-import com.n26.atrposki.utils.events.InMemmoryThreadSafeEventHandlerImpl;
-import com.n26.atrposki.utils.events.IEventHandler;
+import com.n26.atrposki.utils.events.InMemmoryThreadSafeLogicalyTimedEventHandlerImpl;
+import com.n26.atrposki.utils.events.ILogicalyTimedEventHandler;
 import com.n26.atrposki.utils.events.TimedEvent;
 import org.junit.Test;
 
@@ -20,11 +20,11 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 
-public class FireAndForgetSimpleEventImplTests {
+public class EventHandlerTests {
 
     @Test
     public void GivenEronousTask_whenEventIsPublished_NoExceptionsAreRaised(){
-        IEventHandler<Object> event=createSUT();
+        ILogicalyTimedEventHandler<Object> event=createSUT();
         AtomicBoolean isInvoked = new AtomicBoolean(false);
         event.subscribe(x->{
             isInvoked.set(true);
@@ -37,7 +37,7 @@ public class FireAndForgetSimpleEventImplTests {
 
     @Test
     public void GivenHappyFlowTask_whenEventIsPublished_TaskIsExecuted(){
-        IEventHandler<Object> event=createSUT();
+        ILogicalyTimedEventHandler<Object> event=createSUT();
         AtomicBoolean isInvoked = new AtomicBoolean(false);
         event.subscribe(x->isInvoked.set(true));
         event.publish(null);
@@ -47,7 +47,7 @@ public class FireAndForgetSimpleEventImplTests {
 
     @Test
     public void GivenHappyFlowTask_whenEventIsPublished_CorrectMsgIsPropagated(){
-        IEventHandler<Object> event=createSUT();
+        ILogicalyTimedEventHandler<Object> event=createSUT();
         Object msg = new Object();
         event.subscribe(actuallMsg->assertSame("Message is not propagated",msg,actuallMsg.getEvent()));
 
@@ -56,7 +56,7 @@ public class FireAndForgetSimpleEventImplTests {
 
     @Test
     public void GivenBothHappyFlowAndEronousTasks_whenEventIsPublished_AllHapyFLowTaskAreExecuted(){
-        IEventHandler<Object> event = createSUT();
+        ILogicalyTimedEventHandler<Object> event = createSUT();
         AtomicInteger count = new AtomicInteger(0);
         event.subscribe(x->{
             count.incrementAndGet();
@@ -72,7 +72,7 @@ public class FireAndForgetSimpleEventImplTests {
 
     @Test(expected = AggregateException.class)
     public void GivenBothHappyFlowAndEronousTasks_whenEventIsPublishedUnsafely_AggregateExceptionIsTHrown(){
-        InMemmoryThreadSafeEventHandlerImpl event = new InMemmoryThreadSafeEventHandlerImpl<Object>();
+        InMemmoryThreadSafeLogicalyTimedEventHandlerImpl event = new InMemmoryThreadSafeLogicalyTimedEventHandlerImpl<Object>();
         event.subscribe(x->{
             throw new Exception();
         });
@@ -81,7 +81,7 @@ public class FireAndForgetSimpleEventImplTests {
     }
 
     public void whenPublished_eventHistory_savesEvent(){
-        IEventHandler<Object> sut = createSUT();
+        ILogicalyTimedEventHandler<Object> sut = createSUT();
         Object obj =new Object();
         sut.publish(obj);
 
@@ -90,8 +90,35 @@ public class FireAndForgetSimpleEventImplTests {
         assertTrue("expected event not found in event history",history.stream().map(x->x.getEvent()).anyMatch(x->x==obj));
     }
 
-    private IEventHandler<Object> createSUT() {
-        return new InMemmoryThreadSafeEventHandlerImpl<>();
+    @Test
+    public void When4eventsArePublished_getLogicalTimeReturns3_becauseItIsZeroBased(){
+        ILogicalyTimedEventHandler<Object> event=createSUT();
+        Object msg = new Object();
+        event.publish(msg);
+        event.publish(msg);
+        event.publish(msg);
+        event.publish(msg);
+        assertEquals(3,event.getLogicalTime());
+    }
+
+
+    @Test
+    public void GivenAPublishedEvent_whenEventHandlersAreCalled_itIsAlreadyInTheHistory(){
+        ILogicalyTimedEventHandler<Object> event=createSUT();
+        AtomicBoolean bool = new AtomicBoolean(false);
+        Object msg = new Object();
+        event.subscribe(x->{
+            Object actuallMsg = x.getEvent();
+            TimedEvent<Object> lastTimedEvent = event.getHistory().get(event.getHistory().size());
+            Object actuallMsgFromHistory = lastTimedEvent.getEvent();
+            assertSame(actuallMsg,msg);
+            assertSame("Event is not added to history before it is published", actuallMsg,actuallMsgFromHistory);
+        });
+        event.publish(msg);
+    }
+
+    private ILogicalyTimedEventHandler<Object> createSUT() {
+        return new InMemmoryThreadSafeLogicalyTimedEventHandlerImpl<>();
     }
 
 }

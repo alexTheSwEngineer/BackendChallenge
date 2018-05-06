@@ -6,18 +6,21 @@ package com.n26.atrposki.statistics;
  *
  */
 
-import com.n26.atrposki.utils.events.TimedEvent;
-import com.n26.atrposki.utils.time.ITimeService;
 import com.n26.atrposki.domain.AggregateStatistics;
 import com.n26.atrposki.domain.Transaction;
 import com.n26.atrposki.domain.TransactionMadeEventHandler;
+import com.n26.atrposki.utils.events.TimedEvent;
+import com.n26.atrposki.utils.testableAtomics.IAtomicLong;
+import com.n26.atrposki.utils.time.ITimeService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collector;
-import java.util.stream.Collectors;
 
 import static com.n26.atrposki.utils.time.ITimeService.MILISECONDS_IN_MINUTE;
 import static java.util.stream.Collectors.*;
@@ -30,30 +33,38 @@ import static java.util.stream.Collectors.*;
  * Every time a transaction hapenes the aggregated statistics are updated.
  * 2 giant assumptions:
  * a) This will not go into production and hence no memory overflow will happen due to the ineficient way the statistics are calculated on every insert
- * b) There will be much more reads then writes. (if nothing happenes in 60 seconds, no updates will occur).
- *
+ * b) There will be much more reads then writes. (if nothing happenes in 60 seconds, no updates will occur making the statistics stale).
+ * <p>
  * A simple way to fight this is to:
- * a) Keep only a sliding widnow of relevant events having O(1) update sliding window time and O(n) memory and time complexity
+ * a) Keep only a sliding widnow of relevant events having O(1) update sliding window time and O(n) memory complexity
  * b) Schedule transaction expired events, or regular updates in a resonable interval.
- *
+ * <p>
  * If breaking the O(1) memory constrain is a possibility we can keep min/max predecessors so each insert/update/read will be O(1) however we will need O(n) memory.
  * Where N is not from the begining of time, but the number of transactions in a 60  sec window.
- *
- * */
+ */
 @Service
 public class StatisticsService {
+    private static final Logger LOG = LoggerFactory.getLogger(StatisticsService.class);
     private ITimeService timeService;
     private TransactionMadeEventHandler transactionMadeEventHandler;
-    private volatile AggregateStatistics statistics;
-    private AtomicLong lastUpdateLogicalTime;
+    private AggregateStatistics statistics;
+    private IAtomicLong lastUpdateLogicalTime;
 
     @Autowired
-    public StatisticsService(ITimeService timeService, TransactionMadeEventHandler transactionMadeEventHandler) {
+    public StatisticsService(ITimeService timeService, TransactionMadeEventHandler transactionMadeEventHandler, IAtomicLong atomicLong) {
+        atomicLong.forceSet(0l);
         this.timeService = timeService;
         this.transactionMadeEventHandler = transactionMadeEventHandler;
-        lastUpdateLogicalTime = new AtomicLong(0);
+        lastUpdateLogicalTime = atomicLong;
         statistics = new AggregateStatistics();
         transactionMadeEventHandler.subscribe(this::onTransactionMade);
+    }
+
+    public StatisticsService(ITimeService timeService, TransactionMadeEventHandler transactionMadeEventHandler, AggregateStatistics statistics, IAtomicLong lastUpdateLogicalTime) {
+        this.timeService = timeService;
+        this.transactionMadeEventHandler = transactionMadeEventHandler;
+        this.statistics = statistics;
+        this.lastUpdateLogicalTime = lastUpdateLogicalTime;
     }
 
     public AggregateStatistics getStatistics() {
@@ -61,44 +72,90 @@ public class StatisticsService {
     }
 
     /**
-     * This method is envoked on every transaction event an updates the AggregationStatistics if needed.
-     * This method deals with concurency of events and the possibility of a mixed order of events
-     * by only doing an actuall update if the event logical time is larger then the last update logical time (which should be unique).
-     * More over it does that in a syncronized manner curtecy of the atomic integer implementation.
-     * All that being said, this is not really needed in this current scenario. It doesn't matter if the events come in a diferent order
-     * since the statistics is (quite inefficiently) recalculated every time, its only here in this way to showcase the concept. The underlying implementation of getAndUpdate doesn't make it any better.
+     * This method is envoked on every transaction event an updates the AggregationStatistics if needed by recalculating them from the history of events (from the begining of time).
+     * It handles concurency by only recalculating the events if they happened (in logical time) after the last update and no other thread  was quicker.
+     * Start of a rant unimportant for the javadoc:
+     * a) We can safelly assume that the transactionMadeEventHandlers logical time is only going to increment.
+     * However we cannot safelly assume that from the line where we read the time, to the line where we get the events it hasnt changed.
+     * Hence the two similar fail fast ifs. If we have a stale time when we are getting the logical time of the event handler, we don't need to even get the events.
+     * BUT, if we did need to read the event history and we realized that we are looking at a stale history snapshot then we don't need to run the calculations.
+     * Only after we ran the calculation can we go into the syncronized partts that will be kept as lean as possible to avoid performance issues.
+     * b) There are more efficient ways of doing the calculation (example keeping a smaller window ordered by timestampd transactions instead of using all of them since the begining of time).
+     * c) A giant assumption is that we get a constant bussy stream of transactions. This class doesn't update anything unless there is a transaction. We can tackle this by scheduled forced updates
+     * or scheduling a TransactionExpiredEvent 60 seconds after recieving a transaction made event.
      * @param transaction a timed event
      * @return the new logical time for the last update of the AggregateStatistics value.
-     * */
+     */
     public long onTransactionMade(TimedEvent<Transaction> transaction) {
-        lastUpdateLogicalTime.getAndUpdate(now -> {
-            if (now > transaction.getLogicalTime()) {
-                return now;
-            }
+        LOG.info("registered event"+transaction);
+        long utcNowTimestamp = timeService.getUtcNow();
+        long currentEventsTime = transactionMadeEventHandler.getLogicalTime();
+        if(currentEventsTime<lastUpdateLogicalTime.get()){ //avoid heavy calculation if it is already too late.
+            return lastUpdateLogicalTime.get();
+        }
 
-            this.statistics = calculateStatisticsFromLastMinute();
-            return transaction.getLogicalTime();
-        });
-        return lastUpdateLogicalTime.get();
+        List<TimedEvent<Transaction>> eventHistorySnapshot = transactionMadeEventHandler.getHistory();
+        long timeAfterUpdate = getLastEventTimeOr(eventHistorySnapshot, 0);
+        if(timeAfterUpdate < lastUpdateLogicalTime.get()){ //avoid heavy calculation if it is already too late. Note, the
+            return lastUpdateLogicalTime.get();
+        }
+        AggregateStatistics updatedStatistics = calculateStatistics(eventHistorySnapshot, utcNowTimestamp - MILISECONDS_IN_MINUTE, utcNowTimestamp);
+        return tryUpdateStatistics(timeAfterUpdate, updatedStatistics);
     }
 
     /**
-     * @return A new statistics for the last 60 seconds generated from the latest transaction history.
-     * This method gives back "eventualy" consistent results.
-     * However, this is crawling through the history since the begining of time, which is less then optimal.
-     * A better solution would be this service to keep track only of a sliding window of the whole history and aggregate that.
+     * Tries to update the statistics with the newStatistics.
+     * The update will only happen if the newUpdateLogical time is not stale (newUpdateLogicalTime > lastUpdatedTime).
+     * This method is synchronized.
+     * Start of a rant unimportant for the javadoc:
+     * The use of the atomic long may come as surprizing here since this is the only method with sidefects ti this classes fields (in theory) and that means
+     * that (in theory) the lastUpdateLogicalTime will never be modified during this methods execution. This is true (again in theory), and the need for atomic long
+     * does not originate from here. We need an atomic long for the reads in the nonsync methods because as a 64 bit field, the update can take 2 instructions.
+     * @return the last updated logical time. It will be the new UpdatedLogcal time if the update request was not stale or the old unchanged one if the update didn't happen
+     * @param newUpdateLogicalTime the logical time for which the aggregatestatistic is calculated
+     *                             @param newStatistics the new aggregate statistics that need to be set
      * */
-    public AggregateStatistics calculateStatisticsFromLastMinute() {
-        long utcNow = timeService.getUtcNow();
-        long utcBefore1min = utcNow - MILISECONDS_IN_MINUTE;
-        List<Double> recentTransactions = transactionMadeEventHandler.getHistory()
+    public synchronized long tryUpdateStatistics(long newUpdateLogicalTime, AggregateStatistics newStatistics) {
+        long timeBforeUpdate = lastUpdateLogicalTime.get();
+        if(timeBforeUpdate > newUpdateLogicalTime){
+            return timeBforeUpdate;
+        }
+
+        if (lastUpdateLogicalTime.compareAndSet(timeBforeUpdate, newUpdateLogicalTime)) {
+            this.statistics = newStatistics;
+            LOG.info("Statistics updated for logical event time:"+newUpdateLogicalTime+" : "+newStatistics);
+            return newUpdateLogicalTime;
+        }
+
+        return timeBforeUpdate;
+    }
+
+
+    /**
+     * @param transactions  list of transaction events
+     * @param fromTimestamp the begining utc timestamp of the transaction window of interest in miliseconds since utc time 0
+     * @param toTimestamp   the end utc timestamp of the transaction window of interest in miliseconds since utc time 0
+     * @return Aggregated statistics for the events of the colletion passed as a parameter whose transactions happened between fromTimestamp and toTimestamp (from and to included).
+     * It uses a lot of fancy words whilst calculating it like: kahan summation/ compensation sumation.
+     * This was (generously) provided by the java.util.stream.collectors implementation and simply means better floating point precission errors.
+     * @throws IllegalArgumentException if toTimestamp is befor fromTimestamp
+     */
+    public AggregateStatistics calculateStatistics(Collection<TimedEvent<Transaction>> transactions, long fromTimestamp, long toTimestamp) throws IllegalArgumentException {
+        LOG.info("Calculating statistigs from "+fromTimestamp +" to:"+ toTimestamp);
+        if (toTimestamp < fromTimestamp) {
+            throw new IllegalArgumentException("toTimestamp is befor fromTimestamp");
+        }
+
+        //Get snapshot of transactions in window of interest
+        List<Double> recentTransactions = transactions
                 .stream()
-                .filter(x -> x.getEvent().getTimestamp() <= utcNow)
-                .filter(x -> x.getEvent().getTimestamp() >= utcBefore1min)
+                .filter(x -> x.getEvent().getTimestamp() >= fromTimestamp)
+                .filter(x -> x.getEvent().getTimestamp() <= toTimestamp)
                 .map(TimedEvent::getEvent)
                 .map(Transaction::getAmount)
-                .collect(Collectors.toList());
+                .collect(toList());
 
+        //The following sums can be generated by at least one fewer call to the stream.collect(). (avg = sum/count) however it might cause some integer overflow issues if the list is really long
         Double avg = aggregate(recentTransactions, averagingDouble(x -> x));
         Double sum = aggregate(recentTransactions, summingDouble(x -> x));
         Double min = aggregate(recentTransactions, minBy(Double::compare)).orElse(0.0);
@@ -107,8 +164,23 @@ public class StatisticsService {
         return new AggregateStatistics(sum, avg, max, min, count);
     }
 
-
-    private <T> T aggregate(List<Double> lst, Collector<Double, ?, T> collector) {
+     private <TaggregateRez, Telems> TaggregateRez aggregate(List<Telems> lst, Collector<Telems, ?, TaggregateRez> collector) {
         return lst.stream().collect(collector);
+    }
+
+    /**
+     * A method to find the latest event in a list. Current implementation is simly get last element of the list since the event list is being ordered by logical event time.
+     * Start of rant that is not javadoc:
+     * It should be changed with getting the max time if needed in the future
+     * @return The logical time of the last element or the default value if such doesn't exist or the list is null
+     * @param eventHistorySnapshot the source list with events
+     *                             @param defaultValue return value if the list is null or empty
+     * */
+    public long getLastEventTimeOr(List<TimedEvent<Transaction>> eventHistorySnapshot, long defaultValue) {
+        if (eventHistorySnapshot == null || eventHistorySnapshot.isEmpty()) {
+            return defaultValue;
+        }
+
+        return eventHistorySnapshot.get(eventHistorySnapshot.size() - 1).getLogicalTime();
     }
 }

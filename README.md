@@ -4,35 +4,52 @@
 ## Build & Run
 
 ```
-#$ mvn clean install
-#$ mvn eclipse:clean eclipse:eclipse
-#$ mvn idea:clean idea:idea
-#$ java -jar 
+ git clone git@github.com:alexTheSwEngineer/BackendChallenge.git
+ cd BackendChallenge
+ mvn clean install
+ mvn eclipse:clean eclipse:eclipse
+ mvn idea:clean idea:idea
+ java -jar target/backendchallenge-0.0.1-SNAPSHOT.jar
+ 
+```
 
+The solution is a spring boot application that runs on port 8083, if that is busy you can change it by:
+
+```
+java -jar target/backendchallenge-0.0.1-SNAPSHOT.jar --server.port=8082 #or any other port
+
+```
+The mvn clean install command runs some tests that expect exceptions so don't worry about the stack traces in the log.
+
+## Try it out
+
+You can test the system it by hitting the specified endpoints but that is cumbersome. I have provided some debug GET endpoints to make things easier and a **[postman collection](https://www.getpostman.com/collections/0d0997bec4c427d7abe4)** with everything:
+1) GET **/debug/time** returns the timestamp of utc now
+2) GET **/debug/createrandom**  creates a random transaction that happened in the last 60 seconds and pushes it in the transaction service. It then gets the statistics. It returns all of this information in jason format
+3) POST **/api/transactions**
+4) GET **/api/statistics/latest**
+
+Another usefull method is to run
+```
+ watch -n 0,2 curl http://localhost:8083/api/statistics/latest
+
+```
+while hitting the POST endpoint
+Finaly, you can look at the logs which are minimal but pain some kind of picture of what is happening
+
+## Tests
+Tests are run via: 
+```
+mvn test 
+
+```
+The coverage can be seen via the cobertura plugin, it stores them in target/site/cobertura/index.html:
+```
+mvn cobertura:cobertura 
+google-chrome google-chrome target/site/cobertura/index.html
 
 ```
 
-Main ideas/architecture:
-High lvl:
-- GET endpoint should just return a precalculated result. Either from heap or with a o(1) db read (if that is even possible in theory)
-- POST endpoint has to triger aggregation
-- Concerns: 
-	1) Is a query to db with "limit 1" a O(1) operration? 
-	2) On the other hand is reading from a static field a scalable solution (horisontal scaling is more complex)?
-	3) We need some decoupling of concerns between the insert and reagregate operation even though one should triger the other? 
-	4) Concurency: what happenes if one insert transaction operation ends, but before it can update the statistics another, newer insert transaction operation finishes both the insert and the update statistics part? We need to prevent overwriting with stale state due to concurency issues.
-	5) What happenes if there are no transactions for a long time? Need for scheduled update...ish.
-	4) I hate dates in programing, good thing it is in utc.
 
-- Proposed solution:
- A system wehere the getstatistics is just returning a precalculated field with aggregate results and insert a transaction is an expensive operation (aparently both time and moneyvise) because it
-updates the statistics. It does so by firing an event each time. 
-The existance of a (very very very) **rudimentary event system** is important because: 
-	a) decouple insert and update statistics (we dont want to manually triger the code to update the statistics in every new endpoint we create. What if we end up needing statistics for 30 seconds too? We find every existing endpoint and add one more call to a diferent aggregator?)
-	b) Abstract away the transactionality and implementation of the update part. Do we want a transaction to fail if the code for updating the statistics fails? Or is it fire and forget? Is it via method call or via rest call?
-
-The **statistics module** should know the curent 60 secs state in o(1) time. It should also know how to update itself, even it gets a "confused" order of events (good way to do this is to ignore events with event time smaller then the last update time. Ofcourse this is not a dayetime but some sybolik forward only time like for example transaction id in the case of autoincremented ids).
-
-Tests:
--Avoid as much concurency issues as possible  by using immutable objects wherever possible and the syncronized keyword wherever unavoidable
--Avoid instantiation of date/time  objects in favour of date services that can be mocked.(Avoid all static access in favour of injectables for that matter)
+## Consideration 
+A big assumption is that the system handles a lot of transactions. Lack of transactions will make the statistics stale since they only get updated when a transaction occurs.

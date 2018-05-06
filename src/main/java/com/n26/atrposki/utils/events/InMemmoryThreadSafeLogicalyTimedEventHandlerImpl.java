@@ -20,18 +20,18 @@ import static java.util.stream.Collectors.toList;
  * It has however, optimistic expectations about listeners not halting, since it is executed on the callers thread.
  * This naive implementation keeps infinite event history which might prove to be an issue in busy systems. A sliding window solution may be more appropriate with high throughput systems.
  */
-public class InMemmoryThreadSafeEventHandlerImpl<TMsg> implements IEventHandler<TMsg> {
+public class InMemmoryThreadSafeLogicalyTimedEventHandlerImpl<TMsg> implements ILogicalyTimedEventHandler<TMsg> {
     Set<CheckedConsumer<TMsg, Exception>> listeners = ConcurrentHashMap.newKeySet();
     ConcurrentLinkedQueue eventHistory = new ConcurrentLinkedQueue();
     AtomicLong logicalTime = new AtomicLong(-1);
 
-    public InMemmoryThreadSafeEventHandlerImpl() {
+    public InMemmoryThreadSafeLogicalyTimedEventHandlerImpl() {
         this.listeners = ConcurrentHashMap.newKeySet();
         this.eventHistory = new ConcurrentLinkedQueue();
         this.logicalTime = new AtomicLong(-1);
     }
 
-    public InMemmoryThreadSafeEventHandlerImpl(Set<CheckedConsumer<TMsg, Exception>> listeners, ConcurrentLinkedQueue eventHistory, AtomicLong logicalTime) {
+    public InMemmoryThreadSafeLogicalyTimedEventHandlerImpl(Set<CheckedConsumer<TMsg, Exception>> listeners, ConcurrentLinkedQueue eventHistory, AtomicLong logicalTime) {
         this.listeners = listeners;
         this.eventHistory = eventHistory;
         this.logicalTime = logicalTime;
@@ -48,7 +48,7 @@ public class InMemmoryThreadSafeEventHandlerImpl<TMsg> implements IEventHandler<
     }
 
     /**
-     * Calls {@link InMemmoryThreadSafeEventHandlerImpl#publishUnsafely(Object)} and logs any Aggregate exceptions but doesn't propagate them
+     * Calls {@link InMemmoryThreadSafeLogicalyTimedEventHandlerImpl#publishUnsafely(Object)} and logs any Aggregate exceptions but doesn't propagate them
      *
      * @param msg a message to be passed to all the event handlers that are subscribed. It will be wrapped in a TimedEvent together with a loggical incremental time
      */
@@ -68,8 +68,13 @@ public class InMemmoryThreadSafeEventHandlerImpl<TMsg> implements IEventHandler<
      * @returns a copy of the history of events since the inception of this object. This method is thread safe.
      */
     @Override
-    public Collection<TimedEvent<TMsg>> getHistory() {
+    public List<TimedEvent<TMsg>> getHistory() {
         return new ArrayList<TimedEvent<TMsg>>(eventHistory);
+    }
+
+    @Override
+    public long getLogicalTime() {
+        return logicalTime.get();
     }
 
 
